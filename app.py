@@ -1,4 +1,4 @@
-"""$300 Data Recovery — File Listing Converter & Browser.
+"""$300 Data Recovery — File Listing Compactor
 
 Upload a UFS Explorer file-listing HTML report (even the giant ones that
 won't open in a browser), then browse, sort, and search it here — and
@@ -14,7 +14,7 @@ import streamlit as st
 
 import ufs_parser as up
 
-st.set_page_config(page_title="File Listing Browser", page_icon="📁", layout="wide")
+st.set_page_config(page_title="File Listing Compactor", page_icon="📁", layout="wide")
 
 # ---------------- password gate ----------------
 # Password lives in Streamlit secrets only (never in this public repo).
@@ -39,7 +39,7 @@ def check_password() -> bool:
 
     if st.session_state.get("auth"):
         return True
-    st.title("🔒 File Listing Browser")
+    st.title("🔒 File Listing Compactor")
     st.text_input("Password", type="password", key="pw", on_change=entered)
     if st.session_state.get("auth") is False:
         st.error("Incorrect password.")
@@ -74,11 +74,11 @@ def node_at(tree, path):
     return node
 
 
-st.title("📁 File Listing Converter & Browser")
+st.title("📁 File Listing Compactor")
 
 uploaded = st.file_uploader(
-    "Upload a UFS Explorer file-listing report (.html)",
-    type=["html", "htm"],
+    "Upload a UFS Explorer file-listing report (.html, or a .zip containing one)",
+    type=["html", "htm", "zip"],
     help="Works with reports too large to open in a browser.",
 )
 
@@ -87,6 +87,27 @@ if not uploaded:
     st.stop()
 
 file_bytes = uploaded.getvalue()
+src_name = uploaded.name
+if src_name.lower().endswith(".zip"):
+    import io
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+            members = [
+                m for m in z.namelist()
+                if m.lower().endswith((".html", ".htm"))
+                and not m.startswith("__MACOSX")
+            ]
+            if not members:
+                st.error("No .html file found inside that zip.")
+                st.stop()
+            if len(members) > 1:
+                members = [st.selectbox("Multiple HTML files in zip — pick one:", members)]
+            src_name = Path(members[0]).name
+            file_bytes = z.read(members[0])
+    except zipfile.BadZipFile:
+        st.error("That zip file couldn't be opened.")
+        st.stop()
 key = hashlib.sha1(file_bytes).hexdigest()
 
 if st.session_state.get("file_key") != key:
@@ -101,7 +122,7 @@ except up.ParseError as e:
     st.stop()
 
 tree = payload["tree"]
-vol = payload["vol"] or uploaded.name
+vol = payload["vol"] or src_name
 
 # ---------------- header ----------------
 c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
@@ -110,7 +131,7 @@ c2.metric("Files", f"{tree[3]:,}")
 c3.metric("Folders", f"{tree[4]:,}")
 c4.metric("Total size", up.fmt_size(tree[2]))
 
-ticket = re.match(r"^(\d{4,6})\b", uploaded.name)
+ticket = re.match(r"^(\d{4,6})\b", src_name) or re.match(r"^(\d{4,6})\b", uploaded.name)
 out_name = (ticket.group(1) + "-" if ticket else "") + "File-Listing-compact.html"
 compact = build_compact_html(payload, key)
 st.download_button(
