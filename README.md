@@ -35,10 +35,6 @@ The app is gated behind a password entry page. The password lives only in Stream
 
 On Community Cloud: app → Settings → Secrets → paste:
 
-```
-password = "11390"
-```
-
 Locally: create `.streamlit/secrets.toml` in this folder with that same line (and don't commit it — see `.gitignore`).
 
 Notes for Cloud:
