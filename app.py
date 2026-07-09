@@ -52,13 +52,16 @@ if not check_password():
 TEMPLATE = (Path(__file__).parent / "viewer_template.html").read_text(encoding="utf-8")
 
 
-@st.cache_data(show_spinner=False, max_entries=3)
+# cache_resource (NOT cache_data): the parsed tree is huge, and cache_data
+# would deep-copy it on every rerun — that alone can OOM Streamlit Cloud.
+# max_entries=1: keep only the most recent report in memory.
+@st.cache_resource(show_spinner=False, max_entries=1)
 def parse_upload(file_bytes: bytes, _key: str):
     import io
     return up.parse_report(io.BytesIO(file_bytes))
 
 
-@st.cache_data(show_spinner=False, max_entries=3)
+@st.cache_resource(show_spinner=False, max_entries=1)
 def build_compact_html(_payload, key: str) -> bytes:
     return up.to_compact_html(_payload, TEMPLATE)
 
@@ -141,6 +144,10 @@ st.download_button(
     mime="text/html",
     type="primary",
 )
+
+preview = st.toggle("Preview in app (browse & search)", value=False)
+if not preview:
+    st.stop()
 
 tab_browse, tab_search = st.tabs(["🗂 Browse", "🔎 Search"])
 
