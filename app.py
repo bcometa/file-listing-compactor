@@ -1,4 +1,4 @@
-"""$300 Data Recovery — File Listing Compactor
+"""$300 Data Recovery — File Listing Converter & Browser.
 
 Upload a UFS Explorer file-listing HTML report (even the giant ones that
 won't open in a browser), then browse, sort, and search it here — and
@@ -52,18 +52,29 @@ if not check_password():
 TEMPLATE = (Path(__file__).parent / "viewer_template.html").read_text(encoding="utf-8")
 
 
-# cache_resource (NOT cache_data): the parsed tree is huge, and cache_data
-# would deep-copy it on every rerun — that alone can OOM Streamlit Cloud.
-# max_entries=1: keep only the most recent report in memory.
-@st.cache_resource(show_spinner=False, max_entries=1)
-def parse_upload(file_bytes: bytes, _key: str):
+def convert(file_bytes: bytes):
+    """Parse the report and build the compact HTML, then immediately free
+    the huge parsed tree. Only the small compact HTML + summary stats stay
+    resident — this is what keeps the app inside Streamlit Cloud's memory
+    limit (holding the tree while serving a download is what crashed it)."""
+    import gc
     import io
-    return up.parse_report(io.BytesIO(file_bytes))
+    payload = up.parse_report(io.BytesIO(file_bytes))
+    t = payload["tree"]
+    stats = {"vol": payload["vol"], "files": t[3], "dirs": t[4], "size": t[2]}
+    compact = up.to_compact_html(payload, TEMPLATE)
+    del payload, t
+    gc.collect()
+    return compact, stats
 
 
+# Preview only: rebuild the tree from the compressed data on demand.
+# _compact has a leading underscore so Streamlit doesn't hash 10+ MB of
+# bytes on every rerun; `key` alone controls caching. max_entries=1 keeps
+# at most one tree in memory, and only while preview is in use.
 @st.cache_resource(show_spinner=False, max_entries=1)
-def build_compact_html(_payload, key: str) -> bytes:
-    return up.to_compact_html(_payload, TEMPLATE)
+def load_tree(key: str, _compact: bytes):
+    return up.payload_from_compact_html(_compact)["tree"]
 
 
 def node_at(tree, path):
@@ -114,29 +125,31 @@ if src_name.lower().endswith(".zip"):
 key = hashlib.sha1(file_bytes).hexdigest()
 
 if st.session_state.get("file_key") != key:
+    try:
+        with st.spinner("Converting report… (large reports take ~30–60 seconds)"):
+            compact, stats = convert(file_bytes)
+    except up.ParseError as e:
+        st.error(str(e))
+        st.stop()
     st.session_state["file_key"] = key
+    st.session_state["compact"] = compact
+    st.session_state["stats"] = stats
     st.session_state["path"] = []
 
-try:
-    with st.spinner("Parsing report… (large reports take ~30–60 seconds)"):
-        payload = parse_upload(file_bytes, key)
-except up.ParseError as e:
-    st.error(str(e))
-    st.stop()
-
-tree = payload["tree"]
-vol = payload["vol"] or src_name
+compact = st.session_state["compact"]
+stats = st.session_state["stats"]
+del file_bytes
+vol = stats["vol"] or src_name
 
 # ---------------- header ----------------
 c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
 c1.subheader(vol)
-c2.metric("Files", f"{tree[3]:,}")
-c3.metric("Folders", f"{tree[4]:,}")
-c4.metric("Total size", up.fmt_size(tree[2]))
+c2.metric("Files", f"{stats['files']:,}")
+c3.metric("Folders", f"{stats['dirs']:,}")
+c4.metric("Total size", up.fmt_size(stats["size"]))
 
 ticket = re.match(r"^(\d{4,6})\b", src_name) or re.match(r"^(\d{4,6})\b", uploaded.name)
 out_name = (ticket.group(1) + "-" if ticket else "") + "File-Listing-compact.html"
-compact = build_compact_html(payload, key)
 st.download_button(
     f"⬇️ Download compact viewer ({len(compact) / 1e6:.0f} MB standalone HTML for the customer)",
     data=compact,
@@ -145,9 +158,15 @@ st.download_button(
     type="primary",
 )
 
-preview = st.toggle("Preview in app (browse & search)", value=False)
+preview = st.toggle(
+    "Preview in app (browse & search)",
+    value=False,
+    help="Loads the whole listing into memory — leave off if you only need the download.",
+)
 if not preview:
     st.stop()
+
+tree = load_tree(key, compact)
 
 tab_browse, tab_search = st.tabs(["🗂 Browse", "🔎 Search"])
 
