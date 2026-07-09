@@ -51,6 +51,37 @@ if not check_password():
 
 TEMPLATE = (Path(__file__).parent / "viewer_template.html").read_text(encoding="utf-8")
 
+# ===== SLACK CONFIGURATION (same secrets as the ACE Report Converter) =====
+try:
+    SLACK_BOT_TOKEN = st.secrets["SLACK_BOT_TOKEN"]
+    SLACK_CHANNEL_ID = st.secrets["SLACK_CHANNEL_ID"]
+    SLACK_UPLOAD_PASSWORD = st.secrets["SLACK_UPLOAD_PASSWORD"]
+except KeyError:
+    SLACK_BOT_TOKEN = None
+    SLACK_CHANNEL_ID = None
+    SLACK_UPLOAD_PASSWORD = None
+
+
+def upload_to_slack(zip_data, ticket_label, channel_id, token, zip_name):
+    """Upload the ZIP file to the Slack file-listing channel."""
+    try:
+        from slack_sdk import WebClient
+        from slack_sdk.errors import SlackApiError
+
+        client = WebClient(token=token)
+        client.files_upload_v2(
+            channel=channel_id,
+            file=zip_data,
+            filename=zip_name,
+            title=f"File Listing for Ticket {ticket_label}",
+            initial_comment=f"📊 Compacted file listing generated for ticket #{ticket_label}",
+        )
+        return True, "File uploaded successfully to Slack!"
+    except SlackApiError as e:
+        return False, f"Slack API Error: {e.response['error']}"
+    except Exception as e:
+        return False, f"Upload failed: {str(e)}"
+
 
 def convert(file_bytes: bytes):
     """Parse the report and build the compact HTML, then immediately free
@@ -149,14 +180,64 @@ c3.metric("Folders", f"{stats['dirs']:,}")
 c4.metric("Total size", up.fmt_size(stats["size"]))
 
 ticket = re.match(r"^(\d{4,6})\b", src_name) or re.match(r"^(\d{4,6})\b", uploaded.name)
+ticket_label = ticket.group(1) if ticket else src_name
 out_name = (ticket.group(1) + "-" if ticket else "") + "File-Listing-compact.html"
-st.download_button(
-    f"⬇️ Download compact viewer ({len(compact) / 1e6:.0f} MB standalone HTML for the customer)",
-    data=compact,
-    file_name=out_name,
-    mime="text/html",
-    type="primary",
-)
+
+dl_col, slack_col = st.columns([2, 2])
+with dl_col:
+    st.download_button(
+        f"⬇️ Download compact viewer ({len(compact) / 1e6:.0f} MB standalone HTML for the customer)",
+        data=compact,
+        file_name=out_name,
+        mime="text/html",
+        type="primary",
+    )
+with slack_col:
+    if SLACK_BOT_TOKEN:
+        if st.button("💬 Upload to Slack File Listing Channel", type="primary"):
+            st.session_state["show_slack_password"] = True
+            st.session_state["slack_uploaded"] = False
+    else:
+        st.caption("Slack upload unavailable — add SLACK_BOT_TOKEN, SLACK_CHANNEL_ID, "
+                   "and SLACK_UPLOAD_PASSWORD to the app's secrets.")
+
+if st.session_state.get("show_slack_password"):
+    st.markdown("#### 🔐 Enter Password to Upload to Slack")
+    pw_col, _ = st.columns([2, 3])
+    with pw_col:
+        slack_pw = st.text_input(
+            "Password",
+            type="password",
+            key="slack_password_input",
+            placeholder="Enter password to upload",
+        )
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("✅ Confirm Upload", type="primary", width="stretch"):
+                if slack_pw == SLACK_UPLOAD_PASSWORD:
+                    import io
+                    import zipfile as _zf
+                    zip_buf = io.BytesIO()
+                    with _zf.ZipFile(zip_buf, "w", _zf.ZIP_DEFLATED) as z:
+                        z.writestr(out_name, compact)
+                    zip_name = out_name.replace(".html", ".zip")
+                    with st.spinner("Uploading to Slack..."):
+                        ok, msg = upload_to_slack(
+                            zip_buf.getvalue(), ticket_label,
+                            SLACK_CHANNEL_ID, SLACK_BOT_TOKEN, zip_name,
+                        )
+                    if ok:
+                        st.success(f"✅ {msg}")
+                        st.balloons()
+                        st.session_state["show_slack_password"] = False
+                    else:
+                        st.error(f"❌ {msg}")
+                else:
+                    st.error("❌ Incorrect password")
+        with b2:
+            if st.button("❌ Cancel", width="stretch"):
+                st.session_state["show_slack_password"] = False
+                st.rerun()
 
 preview = st.toggle(
     "Preview in app (browse & search)",
