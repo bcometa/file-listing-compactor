@@ -173,11 +173,26 @@ def parse_report(binary_stream):
 
 
 def to_compact_html(payload, template_str):
-    """Splice gzip+base64 payload into the standalone viewer template."""
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    b64 = base64.b64encode(gzip.compress(raw, 9)).decode()
+    """Splice gzip+base64 payload into the standalone viewer template.
+
+    Streams json straight into gzip so the full uncompressed JSON string
+    (which can be hundreds of MB for huge listings) never exists in memory.
+    """
+    buf = io.BytesIO()
+    gz = gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6, mtime=0)
+    with io.TextIOWrapper(gz, encoding="utf-8") as writer:
+        json.dump(payload, writer, ensure_ascii=False, separators=(",", ":"))
+    b64 = base64.b64encode(buf.getvalue()).decode()
     head, tail = template_str.split("__DATA__")
     return (head + b64 + tail).encode("utf-8")
+
+
+def payload_from_compact_html(compact_bytes):
+    """Recover the parsed payload from a compact viewer HTML (for preview)."""
+    m = re.search(rb'<script id="payload"[^>]*>([^<]*)</script>', compact_bytes)
+    if not m:
+        raise ParseError("Couldn't find embedded data in compact HTML.")
+    return json.loads(gzip.decompress(base64.b64decode(m.group(1))))
 
 
 def walk_search(tree, query, limit=5000):
