@@ -34,9 +34,18 @@ class ParseError(Exception):
 
 
 def parse_report(binary_stream):
-    """Parse a UFS Explorer report. Returns {'vol': str, 'tree': node}."""
+    """Parse a UFS Explorer report. Returns {'vol': str, 'tree': node}.
+
+    Handles both report variants:
+    - Variant A (e.g. #72288): each folder's 'c' array contains rows for BOTH
+      files (flag 1) and subfolders (flag 0), and blocks also carry 'p'.
+    - Variant B (e.g. #72974): 'c' arrays contain ONLY file rows; the folder
+      hierarchy exists solely through each block's 'p' parent pointer.
+    The tree is therefore built from 'p' pointers (authoritative in both);
+    flag-0 rows are used only as metadata (folder timestamps).
+    """
     text = io.TextIOWrapper(binary_stream, encoding="utf-8-sig", errors="replace")
-    folders = {}   # id -> {'n', 'p', 'files', 'dirs'}
+    folders = {}   # id -> {'n', 'p', 'files', 'dmeta': {child_id: ts}}
     root_id = None
     vol_name = ""
     cur = None
@@ -46,11 +55,10 @@ def parse_report(binary_stream):
         if not m:
             return False
         _id, size, isfile, ts, name, _cc = m.groups()
-        name = _unesc(name)
         if isfile == "1":
-            cur["files"].append([name, int(size), int(ts)])
+            cur["files"].append([_unesc(name), int(size), int(ts)])
         else:
-            cur["dirs"].append((int(_id), name, int(ts)))
+            cur["dmeta"][int(_id)] = (_unesc(name), int(ts))
         return True
 
     for line in text:
@@ -85,7 +93,7 @@ def parse_report(binary_stream):
             continue
         m = FLD_RE.match(line)
         if m:
-            cur = {"n": "", "p": None, "files": [], "dirs": []}
+            cur = {"n": "", "p": None, "files": [], "dmeta": {}}
             folders[int(m.group(1))] = cur
             continue
         m = ROOT_RE.match(line)
@@ -102,59 +110,80 @@ def parse_report(binary_stream):
             "(no folder data / root marker found)."
         )
 
-    # ---- build nested tree iteratively --------------------------------
-    def make_node(fid, fallback_name, ts):
-        rec = folders.get(fid)
-        name = (rec["n"] if rec and rec["n"] else fallback_name) or ""
-        files = rec["files"] if rec else []
-        dirs = rec["dirs"] if rec else []
-        return [name, ts, 0, 0, 0, files, []], dirs
+    # ---- build hierarchy from 'p' parent pointers ---------------------
+    children = {}  # parent folder id -> [child folder ids]
+    for fid, rec in folders.items():
+        p = rec["p"]
+        if p is not None and p != fid and p in folders:
+            children.setdefault(p, []).append(fid)
+    if not children:
+        # Parent pointers unusable (all self/missing) — fall back to the
+        # variant-A flag-0 child rows for linkage instead.
+        for fid, rec in folders.items():
+            for cid in rec["dmeta"]:
+                if cid in folders and cid != fid:
+                    children.setdefault(fid, []).append(cid)
 
     visited = set()
     order = []
 
-    def grow(seed_node, seed_dirs):
-        stack = [(seed_node, seed_dirs)]
+    def grow(seed_id, seed_node):
+        stack = [(seed_id, seed_node)]
         while stack:
-            node, dirs = stack.pop()
+            fid, node = stack.pop()
             order.append(node)
-            for did, dname, dts in dirs:
-                if did in visited:
+            rec = folders[fid]
+            for cid in children.get(fid, ()):
+                if cid in visited:
                     continue
-                visited.add(did)
-                child, cdirs = make_node(did, dname, dts)
+                visited.add(cid)
+                crec = folders[cid]
+                meta = rec["dmeta"].get(cid)
+                cname = crec["n"] or (meta[0] if meta else "")
+                child = [cname, meta[1] if meta else 0, 0, 0, 0,
+                         crec["files"], []]
                 node[6].append(child)
-                stack.append((child, cdirs))
+                stack.append((cid, child))
 
-    root_node, root_dirs = make_node(root_id, vol_name or "Root", 0)
+    root_rec = folders.get(root_id)
+    root_name = (root_rec["n"] if root_rec and root_rec["n"] else "") or vol_name or "Root"
+    root_node = [root_name, 0, 0, 0, 0,
+                 root_rec["files"] if root_rec else [], []]
     visited.add(root_id)
-    grow(root_node, root_dirs)
+    if root_rec:
+        grow(root_id, root_node)
+    else:
+        order.append(root_node)
 
-    # attach orphan trees (chains that never reach the root)
+    # attach orphan trees (parent chains that never reach the root)
     def chain_top(fid):
         seen = set()
         while fid not in seen:
             seen.add(fid)
             p = folders[fid]["p"]
-            if p is None or p == fid or p not in folders:
+            if p is None or p == fid or p not in folders or p in visited:
                 return fid
             fid = p
         return fid
 
     tops = {chain_top(f) for f in folders if f not in visited}
     tops = {t for t in tops if t not in visited}
+    extra_files = []  # accumulated once at the end (O(n), not O(n^2))
     for t in sorted(tops):
         visited.add(t)
-        tnode, tdirs = make_node(t, folders[t]["n"] or "(Recovered items)", 0)
+        trec = folders[t]
+        tnode = [trec["n"] or "(Recovered items)", 0, 0, 0, 0, trec["files"], []]
         pre = len(order)
-        grow(tnode, tdirs)
-        if folders[t]["n"]:
+        grow(t, tnode)
+        if trec["n"]:
             root_node[6].append(tnode)
         else:
             # unnamed top: merge its children straight into the root
-            root_node[5].extend(tnode[5])
+            extra_files.extend(tnode[5])
             root_node[6].extend(tnode[6])
             order.pop(pre)  # drop the placeholder top node itself
+    if extra_files:
+        root_node[5] = root_node[5] + extra_files
 
     # ---- totals + alphabetical base order (children before parents) ---
     for node in reversed(order):
@@ -169,7 +198,13 @@ def parse_report(binary_stream):
         node[5].sort(key=lambda f: f[0].lower())
         node[6].sort(key=lambda d: d[0].lower())
 
-    return {"vol": vol_name, "tree": root_node}
+    # Flat-report detection: many folder blocks but no reconstructable
+    # hierarchy means UFS Explorer exported the report without folder
+    # names/links (seen on ticket #72974 — 270k unnamed, self-parented
+    # folder blocks). The listing is still complete, just flat.
+    flat = len(folders) >= 50 and root_node[4] == 0
+
+    return {"vol": vol_name, "tree": root_node, "flat": flat}
 
 
 def to_compact_html(payload, template_str):
